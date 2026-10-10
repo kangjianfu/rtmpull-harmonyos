@@ -12,6 +12,7 @@ find_library(media_acodec_lib native_media_acodec)
 find_library(media_core_lib native_media_core)
 find_library(media_codecbase_lib native_media_codecbase)
 find_library(native_window_lib native_window)
+find_library(ohaudio_lib ohaudio)
 find_library(hilog_lib hilog_ndk.z)
 
 target_link_libraries(pull_decoder PUBLIC
@@ -22,5 +23,6 @@ target_link_libraries(pull_decoder PUBLIC
     ${media_core_lib}
     ${media_codecbase_lib}
     ${native_window_lib}
+    ${ohaudio_lib}
     ${hilog_lib}
 )

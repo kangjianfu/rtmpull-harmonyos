@@ -7,15 +7,16 @@
 | 模块 | 说明 |
 |------|------|
 | `FlvPullClient` | 纯 ArkTS HTTP-FLV 拉流 + FLV 解封装：视频（H.264 老 FLV tag / H.265 Enhanced RTMP hvc1）、AAC、onMetaData 宽高解析、实测接收速率统计 |
-| `PullPlayer` | 播放器封装：native 硬解（NDK）→ XComponent surface 零拷贝直渲；AAC → PCM → AudioRenderer（音频时钟驱动，欠载补静音） |
+| `PullPlayer` | 播放器封装：native 硬解（NDK）→ XComponent surface 零拷贝直渲；AAC → PCM → native OHAudio 直出（不经 ArkTS 中转，欠载补静音） |
 
 ## 特性
 
 - 视频硬解直渲（surface 模式），直播低延迟：解码即显示，不攒帧
-- H.264 + **H.265（Enhanced RTMP hvc1，与 rtmpush 推流端配套）**
+- H.264 + **H.265**（Enhanced RTMP hvc1：标准封装与 rtmpush 旧版配套封装自动识别，可接 SRS 等标准服务器）
 - AAC 硬解，采样率/声道从 ASC 自动解析
-- 解码跟不上时丢帧保实时（队列按字节限长）
-- 断流回调（`onClosed`），上层可自重连
+- 解码跟不上时丢帧保实时（优先丢非关键帧、按 GOP 丢，避免花屏）
+- 断流回调（`onClosed`），上层可自重连；10 秒无数据看门狗主动判定断流
+- 解码器错误经 `onError` 回调上报
 
 ## 快速开始
 
@@ -56,7 +57,7 @@ hdc install demo/build/default/outputs/default/demo-default-unsigned.hap
 ## 已知限制
 
 - 仅 HTTP-FLV 拉流（https 暂不支持；RTMP 拉流在路线图）
-- 音视频同步为「音频时钟 + 视频解码即显」的直播策略，不追求文件播放级的精确同步
+- 音画同步为「native 音频时钟 + 视频迟到丢帧」的直播策略（晚于音频时钟 120ms 的视频帧不渲染），不追求文件播放级的精确同步
 - 模拟器无相机但**有解码器**，播放链路模拟器可验；推流端（rtmpush）必须真机
 
 ## License

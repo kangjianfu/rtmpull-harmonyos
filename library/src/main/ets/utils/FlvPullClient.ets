@@ -1,6 +1,7 @@
 // FlvPullClient.ets — 纯 ArkTS HTTP-FLV 拉流 + FLV 解封装（自研，无第三方依赖）
 // TCPSocket 发 HTTP GET → FLV 流 → 拆 tag：视频(H.264/H.265)、音频(AAC)、元数据
-// 视频帧输出为 AVCC（长度前缀 NALU），音频为 raw AAC；支持 Enhanced RTMP hvc1 封装
+// 视频帧输出为 AVCC（长度前缀 NALU），音频为 raw AAC
+// H.265 同时兼容标准 Enhanced RTMP（fourcc 在 byte1）和旧版配套封装（fourcc 在 byte2），自动识别
 import { socket } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
 
@@ -20,7 +21,7 @@ export interface PullEvents {
   onAudioFrame: (data: Uint8Array, ptsMs: number) => void;
   /** 元数据里的宽高（从 onMetaData 解析，解析不到给 0） */
   onMeta: (width: number, height: number) => void;
-  /** 连接断开（非正常 stop） */
+  /** 连接断开或收流超时（非正常 stop） */
   onClosed: () => void;
 }
 
@@ -50,25 +51,39 @@ function parseHttpUrl(url: string): FlvUrl {
   return { host: host, port: port, path: path };
 }
 
+/** 24bit 有符号整数（FLV CompositionTime 可为负） */
+function s24(a: number, b: number, c: number): number {
+  let v = (a << 16) | (b << 8) | c;
+  if (v >= 0x800000) {
+    v -= 0x1000000;
+  }
+  return v;
+}
+
 interface RecvStat {
   t: number;
   bytes: number;
 }
+
+const NO_DATA_TIMEOUT_MS = 10000; // 收流看门狗：连续无数据判定断流
+const WATCHDOG_INTERVAL_MS = 2000;
 
 export class FlvPullClient {
   onLog: PullLog = () => {};
   events: PullEvents | null = null;
 
   private tcp: socket.TCPSocket = socket.constructTCPSocketInstance();
-  private buf: Uint8Array = new Uint8Array(0);
+  // 分块缓冲：parse 按需合并，避免每次收包整体拷贝（O(n²) → 每 tag 至多一次拷贝）
+  private chunks: Uint8Array[] = [];
+  private bufLen: number = 0;
   private closing: boolean = false;
   private headerDone: boolean = false;
   private flvHeaderDone: boolean = false;
   private recvStats: RecvStat[] = [];
   private metaFired: boolean = false;
   private videoCodec: VideoCodecName = 'avc';
-  private videoConfigSent: boolean = false;
-  private audioConfigSent: boolean = false;
+  private lastRecvAt: number = 0;
+  private watchdogTimer: number = -1;
 
   async connect(url: string): Promise<void> {
     const info = parseHttpUrl(url);
@@ -79,8 +94,9 @@ export class FlvPullClient {
     });
     this.tcp.on('message', (data: socket.SocketMessageInfo) => {
       if (data.message) {
-        this.recvStats.push({ t: Date.now(), bytes: data.message.byteLength });
-        const cutoff = Date.now() - 4000;
+        this.lastRecvAt = Date.now();
+        this.recvStats.push({ t: this.lastRecvAt, bytes: data.message.byteLength });
+        const cutoff = this.lastRecvAt - 4000;
         while (this.recvStats.length > 0 && this.recvStats[0].t < cutoff) {
           this.recvStats.shift();
         }
@@ -101,6 +117,21 @@ export class FlvPullClient {
     });
     const req = `GET ${info.path} HTTP/1.1\r\nHost: ${info.host}\r\nAccept: */*\r\nConnection: close\r\n\r\n`;
     await this.tcp.send({ data: new util.TextEncoder().encodeInto(req).buffer });
+    // 收流看门狗：服务器假死（TCP 半开、不再发数据）时主动判定断流
+    this.lastRecvAt = Date.now();
+    this.watchdogTimer = setInterval(() => {
+      if (!this.closing && Date.now() - this.lastRecvAt > NO_DATA_TIMEOUT_MS) {
+        this.onLog('收流超时（10 秒无数据）');
+        this.close();
+        this.events?.onClosed();
+      }
+    }, WATCHDOG_INTERVAL_MS);
+  }
+
+  /** 异常断流：关闭连接并通知上层（正常 stop 走 close()，不触发 onClosed） */
+  private failClosed(): void {
+    this.close();
+    this.events?.onClosed();
   }
 
   /** 最近 3 秒实际接收速率（kbps）；样本不足返回 -1 */
@@ -123,6 +154,10 @@ export class FlvPullClient {
 
   async close(): Promise<void> {
     this.closing = true;
+    if (this.watchdogTimer >= 0) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = -1;
+    }
     try {
       await this.tcp.close();
     } catch (e) { /* 忽略 */ }
@@ -131,63 +166,111 @@ export class FlvPullClient {
   // ---------------- 流式解析 ----------------
 
   private pushBytes(data: Uint8Array): void {
-    const merged = new Uint8Array(this.buf.length + data.length);
-    merged.set(this.buf);
-    merged.set(data, this.buf.length);
-    this.buf = merged;
+    this.chunks.push(data);
+    this.bufLen += data.length;
     this.parse();
+  }
+
+  /** 返回头部连续 n 字节视图（不足返回 null；必要时把 chunks 合并成一整块） */
+  private peek(n: number): Uint8Array | null {
+    if (this.bufLen < n || this.chunks.length === 0) {
+      return null;
+    }
+    if (this.chunks[0].length >= n) {
+      return this.chunks[0];
+    }
+    const merged = new Uint8Array(this.bufLen);
+    let off = 0;
+    for (const c of this.chunks) {
+      merged.set(c, off);
+      off += c.length;
+    }
+    this.chunks = [merged];
+    return merged;
+  }
+
+  private consume(n: number): void {
+    this.bufLen -= n;
+    while (n > 0 && this.chunks.length > 0) {
+      const c = this.chunks[0];
+      if (c.length <= n) {
+        n -= c.length;
+        this.chunks.shift();
+      } else {
+        this.chunks[0] = c.subarray(n);
+        n = 0;
+      }
+    }
   }
 
   private parse(): void {
     for (;;) {
       if (!this.headerDone) {
-        // HTTP 头到 \r\n\r\n
-        const idx = this.findCrlfCrlf();
-        if (idx < 0) {
+        // HTTP 头到 \r\n\r\n（头很小，直接合并全量找）
+        if (this.bufLen === 0) {
           return;
         }
-        const head = new util.TextDecoder('utf-8').decodeToString(this.buf.subarray(0, idx));
-        if (!head.includes('200')) {
-          this.onLog('HTTP 响应异常: ' + head.split('\r\n')[0]);
+        const all = this.peek(this.bufLen);
+        if (!all) {
+          return;
         }
-        this.onLog('HTTP 已连接');
-        this.buf = this.buf.subarray(idx + 4);
+        const idx = this.findCrlfCrlf(all);
+        if (idx < 0) {
+          if (this.bufLen > 64 * 1024) {
+            this.onLog('HTTP 响应头异常');
+            this.failClosed();
+          }
+          return;
+        }
+        const head = new util.TextDecoder('utf-8').decodeToString(all.subarray(0, idx));
+        const statusLine = head.split('\r\n')[0];
+        if (!statusLine.includes(' 200')) {
+          this.onLog('HTTP 响应异常: ' + statusLine);
+        } else {
+          this.onLog('HTTP 已连接');
+        }
+        this.consume(idx + 4);
         this.headerDone = true;
       }
       if (!this.flvHeaderDone) {
         // FLV 头 9 字节 + PreviousTagSize0 4 字节
-        if (this.buf.length < 13) {
+        const h = this.peek(13);
+        if (!h) {
           return;
         }
-        if (this.buf[0] !== 0x46 || this.buf[1] !== 0x4c || this.buf[2] !== 0x56) { // "FLV"
+        if (h[0] !== 0x46 || h[1] !== 0x4c || h[2] !== 0x56) { // "FLV"
           this.onLog('不是 FLV 流');
-          this.close();
+          this.failClosed();
           return;
         }
-        this.buf = this.buf.subarray(13);
+        this.consume(13);
         this.flvHeaderDone = true;
         this.onLog('FLV 流就绪');
       }
       // tag 头 11 字节 + body + prevTagSize 4
-      if (this.buf.length < 15) {
+      const head = this.peek(15);
+      if (!head) {
         return;
       }
-      const b = this.buf;
-      const tagType = b[0];
-      const dataSize = (b[1] << 16) | (b[2] << 8) | b[3];
-      const ts = (b[4] << 16) | (b[5] << 8) | b[6] | (b[7] << 24);
-      if (this.buf.length < 15 + dataSize) {
+      const tagType = head[0];
+      const dataSize = (head[1] << 16) | (head[2] << 8) | head[3];
+      const ts = ((head[4] << 16) | (head[5] << 8) | head[6] | (head[7] << 24)) >>> 0;
+      if (this.bufLen < 15 + dataSize) {
         return;
       }
-      const body = this.buf.subarray(11, 11 + dataSize);
-      this.buf = this.buf.subarray(15 + dataSize);
+      const full = this.peek(15 + dataSize);
+      if (!full) {
+        return;
+      }
+      const body = full.subarray(11, 11 + dataSize);
+      this.consume(15 + dataSize);
       this.handleTag(tagType, body, ts);
     }
   }
 
-  private findCrlfCrlf(): number {
-    for (let i = 0; i + 3 < this.buf.length; i++) {
-      if (this.buf[i] === 13 && this.buf[i + 1] === 10 && this.buf[i + 2] === 13 && this.buf[i + 3] === 10) {
+  private findCrlfCrlf(buf: Uint8Array): number {
+    for (let i = 0; i + 3 < buf.length; i++) {
+      if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) {
         return i;
       }
     }
@@ -212,37 +295,50 @@ export class FlvPullClient {
   private handleVideo(body: Uint8Array, ts: number, ev: PullEvents): void {
     const b0 = body[0];
     if ((b0 & 0x80) !== 0) {
-      // Enhanced RTMP：byte0=FrameType|ExHeader|PacketType高2位，byte1=PacketType低位<<7，然后 fourcc
-      const frameType = b0 >> 4;
-      const packetType = ((b0 & 0x03) << 1) | (body[1] >> 7);
-      const fourcc = String.fromCharCode(body[2], body[3], body[4], body[5]);
-      if (fourcc !== 'hvc1') {
-        return; // 只认 hvc1
+      // Enhanced RTMP：byte0 = IsExHeader|FrameType(3bit)|PacketType(4bit)
+      const frameType = (b0 >> 4) & 0x07;
+      const isKey = frameType === 1;
+      if (body.length >= 5 && String.fromCharCode(body[1], body[2], body[3], body[4]) === 'hvc1') {
+        // 标准封装（enhanced-RTMP v2）：fourcc 紧跟 byte0
+        const packetType = b0 & 0x0f;
+        this.videoCodec = 'hevc';
+        if (packetType === 0) { // SequenceStart
+          ev.onVideoConfig('hevc', body.subarray(5));
+        } else if (packetType === 1 && body.length >= 8) { // CodedFrames（带 CTS）
+          const cts = s24(body[5], body[6], body[7]);
+          ev.onVideoFrame(body.subarray(8), ts + cts, isKey);
+        } else if (packetType === 3) { // CodedFramesX（无 CTS）
+          ev.onVideoFrame(body.subarray(5), ts, isKey);
+        }
+        return;
       }
-      this.videoCodec = 'hevc';
-      if (packetType === 0) {
-        this.videoConfigSent = true;
-        ev.onVideoConfig('hevc', body.subarray(6));
-      } else if (packetType === 1) {
-        const cts = (body[6] << 16) | (body[7] << 8) | body[8];
-        ev.onVideoFrame(body.subarray(9), ts + cts, frameType === 1);
-      } else if (packetType === 3) {
-        ev.onVideoFrame(body.subarray(6), ts, frameType === 1);
+      if (body.length >= 6 && String.fromCharCode(body[2], body[3], body[4], body[5]) === 'hvc1') {
+        // 旧版配套封装（rtmpush 早期版本）：PacketType 3bit 跨 byte0 低 2 位 + byte1 最高位，fourcc 在 byte2
+        const packetType = ((b0 & 0x03) << 1) | (body[1] >> 7);
+        this.videoCodec = 'hevc';
+        if (packetType === 0) {
+          ev.onVideoConfig('hevc', body.subarray(6));
+        } else if (packetType === 1 && body.length >= 9) {
+          const cts = s24(body[6], body[7], body[8]);
+          ev.onVideoFrame(body.subarray(9), ts + cts, isKey);
+        } else if (packetType === 3) {
+          ev.onVideoFrame(body.subarray(6), ts, isKey);
+        }
+        return;
       }
-      return;
+      return; // 只认 hvc1
     }
     // 老 FLV tag：frameType|codecId(7=AVC)
     const frameType = b0 >> 4;
     const codecId = b0 & 0x0f;
-    if (codecId !== 7) {
+    if (codecId !== 7 || body.length < 5) {
       return;
     }
     const avcType = body[1];
-    const cts = (body[2] << 16) | (body[3] << 8) | body[4];
     if (avcType === 0) {
-      this.videoConfigSent = true;
       ev.onVideoConfig('avc', body.subarray(5));
     } else if (avcType === 1) {
+      const cts = s24(body[2], body[3], body[4]);
       ev.onVideoFrame(body.subarray(5), ts + cts, frameType === 1);
     }
   }
@@ -252,7 +348,6 @@ export class FlvPullClient {
       return; // 只认 AAC 44k 16bit
     }
     if (body[1] === 0) {
-      this.audioConfigSent = true;
       ev.onAudioConfig(body.subarray(2));
     } else {
       ev.onAudioFrame(body.subarray(2), ts);
@@ -266,7 +361,7 @@ export class FlvPullClient {
     const enc = new util.TextEncoder();
     const findNum = (key: string): number => {
       const kb = enc.encodeInto(key);
-      for (let i = 0; i + kb.length + 9 < body.length; i++) {
+      for (let i = 0; i + kb.length + 9 <= body.length; i++) {
         let match = true;
         for (let j = 0; j < kb.length; j++) {
           if (body[i + j] !== kb[j]) {

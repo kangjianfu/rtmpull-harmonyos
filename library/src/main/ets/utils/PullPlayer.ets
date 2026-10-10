@@ -1,6 +1,5 @@
-// PullPlayer.ets — 拉流播放器封装：FlvPullClient 拉流解封装 → native 硬解 → XComponent 直渲 + AudioRenderer 出声
+// PullPlayer.ets — 拉流播放器封装：FlvPullClient 拉流解封装 → native 硬解 → XComponent 直渲 + native OHAudio 出声
 // 用法：setSurfaceId（XComponent onLoad 时）→ play(url) → stop()
-import { audio } from '@kit.AudioKit';
 import pullDecoder from 'libpull_decoder.so';
 import { FlvPullClient, VideoCodecName } from './FlvPullClient';
 
@@ -8,10 +7,10 @@ export type PlayerLog = (msg: string) => void;
 
 interface NativePullDecoder {
   createVideoDecoder(surfaceId: string, mime: string, width: number, height: number, codecConfig: ArrayBuffer): boolean;
-  pushVideoFrame(data: ArrayBuffer, ptsUs: number): boolean;
+  pushVideoFrame(data: ArrayBuffer, ptsUs: number, isKey: boolean): boolean;
+  /** 创建 AAC 解码器并启动 native 音频渲染（PCM 不经 ArkTS 中转） */
   createAudioDecoder(sampleRate: number, channels: number, asc: ArrayBuffer): boolean;
   pushAudioFrame(data: ArrayBuffer, ptsUs: number): boolean;
-  setPcmCallback(cb: (pcm: ArrayBuffer, ptsUs: number) => void): boolean;
   stopAll(): boolean;
 }
 
@@ -19,26 +18,10 @@ const decoder: NativePullDecoder = pullDecoder as NativePullDecoder;
 
 const FREQ_TABLE: number[] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000];
 
-function sampleRateEnum(rate: number): audio.AudioSamplingRate {
-  switch (rate) {
-    case 8000: return audio.AudioSamplingRate.SAMPLE_RATE_8000;
-    case 11025: return audio.AudioSamplingRate.SAMPLE_RATE_11025;
-    case 12000: return audio.AudioSamplingRate.SAMPLE_RATE_12000;
-    case 16000: return audio.AudioSamplingRate.SAMPLE_RATE_16000;
-    case 22050: return audio.AudioSamplingRate.SAMPLE_RATE_22050;
-    case 24000: return audio.AudioSamplingRate.SAMPLE_RATE_24000;
-    case 32000: return audio.AudioSamplingRate.SAMPLE_RATE_32000;
-    case 48000: return audio.AudioSamplingRate.SAMPLE_RATE_48000;
-    case 64000: return audio.AudioSamplingRate.SAMPLE_RATE_64000;
-    case 88200: return audio.AudioSamplingRate.SAMPLE_RATE_88200;
-    case 96000: return audio.AudioSamplingRate.SAMPLE_RATE_96000;
-    default: return audio.AudioSamplingRate.SAMPLE_RATE_44100;
-  }
-}
-
 export class PullPlayer {
   onLog: PlayerLog = () => {};
   onClosed: () => void = () => {}; // 流断开（正常 stop 不触发）
+  onError: PlayerLog = () => {}; // 解码器等内部错误（播放不中断的可忽略）
 
   private client: FlvPullClient = new FlvPullClient();
   private surfaceId: string = '';
@@ -46,8 +29,6 @@ export class PullPlayer {
   private audioStarted: boolean = false;
   private metaW: number = 0;
   private metaH: number = 0;
-  private renderer: audio.AudioRenderer | null = null;
-  private pcmQueue: ArrayBuffer[] = [];
   private playing: boolean = false;
 
   /** XComponent onLoad 时传入 surfaceId */
@@ -67,7 +48,14 @@ export class PullPlayer {
     if (!this.surfaceId) {
       throw new Error('请先 setSurfaceId（XComponent onLoad 回调）');
     }
-    this.stopDecoderOnly();
+    if (this.playing) {
+      this.onLog('正在播放中，忽略重复的 play 调用');
+      return;
+    }
+    // 清理上一次会话的残留（断流后未 stop 直接重播的场景）
+    this.cleanupSession();
+    const oldClient = this.client;
+    oldClient.close().catch(() => { /* 忽略 */ });
     this.playing = true;
     const client = new FlvPullClient();
     this.client = client;
@@ -84,7 +72,7 @@ export class PullPlayer {
       onVideoFrame: (data: Uint8Array, ptsMs: number, isKey: boolean) => {
         if (this.videoStarted) {
           // subarray → 独立 ArrayBuffer（native 按整个 buffer 读）
-          decoder.pushVideoFrame(data.slice().buffer as ArrayBuffer, ptsMs * 1000);
+          decoder.pushVideoFrame(data.slice().buffer as ArrayBuffer, ptsMs * 1000, isKey);
         }
       },
       onAudioConfig: (asc: Uint8Array) => {
@@ -102,11 +90,19 @@ export class PullPlayer {
       },
       onClosed: () => {
         if (this.playing) {
+          this.playing = false;
+          this.cleanupSession(); // 释放解码器/播放器，避免上层不 stop 时泄漏
           this.onClosed();
         }
       }
     };
-    await client.connect(url);
+    try {
+      await client.connect(url);
+    } catch (e) {
+      this.playing = false;
+      this.cleanupSession();
+      throw e;
+    }
   }
 
   private startVideo(codec: VideoCodecName, config: Uint8Array): void {
@@ -116,12 +112,19 @@ export class PullPlayer {
     const mime = codec === 'hevc' ? 'video/hevc' : 'video/avc';
     const w = this.metaW > 0 ? this.metaW : 1280;
     const h = this.metaH > 0 ? this.metaH : 720;
-    decoder.createVideoDecoder(this.surfaceId, mime, w, h, config.slice().buffer as ArrayBuffer);
-    this.videoStarted = true;
-    this.onLog(`视频解码器已启动（${codec === 'hevc' ? 'H.265' : 'H.264'} ${w}x${h}）`);
+    try {
+      const ok = decoder.createVideoDecoder(this.surfaceId, mime, w, h, config.slice().buffer as ArrayBuffer);
+      if (!ok) {
+        throw new Error('视频解码器创建失败');
+      }
+      this.videoStarted = true;
+      this.onLog(`视频解码器已启动（${codec === 'hevc' ? 'H.265' : 'H.264'} ${w}x${h}）`);
+    } catch (e) {
+      this.onError(`视频解码器启动失败: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
-  private async startAudio(asc: Uint8Array): Promise<void> {
+  private startAudio(asc: Uint8Array): void {
     if (this.audioStarted || asc.length < 2) {
       return;
     }
@@ -129,60 +132,30 @@ export class PullPlayer {
     const rateIdx = ((asc[0] & 0x07) << 1) | (asc[1] >> 7);
     const rate = rateIdx < FREQ_TABLE.length ? FREQ_TABLE[rateIdx] : 44100;
     const ch = ((asc[1] >> 3) & 0x0f) || 1;
-    decoder.createAudioDecoder(rate, ch, asc.slice().buffer as ArrayBuffer);
-    this.onLog(`音频解码器已启动（AAC ${rate}Hz ${ch}ch）`);
-
-    const streamInfo: audio.AudioStreamInfo = {
-      samplingRate: sampleRateEnum(rate),
-      channels: ch === 1 ? audio.AudioChannel.CHANNEL_1 : audio.AudioChannel.CHANNEL_2,
-      sampleFormat: audio.AudioSampleFormat.SAMPLE_FORMAT_S16LE,
-      encodingType: audio.AudioEncodingType.ENCODING_TYPE_RAW
-    };
-    const rendererInfo: audio.AudioRendererInfo = {
-      usage: audio.StreamUsage.STREAM_USAGE_MEDIA,
-      rendererFlags: 0
-    };
-    const renderer = await audio.createAudioRenderer({
-      streamInfo: streamInfo,
-      rendererInfo: rendererInfo
-    });
-    this.renderer = renderer;
-    // PCM 供给：tsfn 回调入队，renderer 拉取（音频时钟驱动播放节奏）
-    decoder.setPcmCallback((pcm: ArrayBuffer, ptsUs: number) => {
-      if (this.pcmQueue.length >= 50) {
-        this.pcmQueue.shift();
+    try {
+      const ok = decoder.createAudioDecoder(rate, ch, asc.slice().buffer as ArrayBuffer);
+      if (!ok) {
+        throw new Error('音频解码器创建失败');
       }
-      this.pcmQueue.push(pcm);
-    });
-    renderer.on('writeData', (data: ArrayBuffer) => {
-      const next = this.pcmQueue.shift();
-      const view = new Uint8Array(data);
-      if (next) {
-        view.set(new Uint8Array(next).subarray(0, view.length));
-      } else {
-        view.fill(0); // 欠载补静音
-      }
-    });
-    await renderer.start();
+      this.onLog(`音频解码器已启动（AAC ${rate}Hz ${ch}ch）`);
+    } catch (e) {
+      this.audioStarted = false;
+      this.onError(`音频初始化失败: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
-  private stopDecoderOnly(): void {
+  /** 释放本次会话的解码/渲染资源（不动 TCP 连接） */
+  private cleanupSession(): void {
     this.videoStarted = false;
     this.audioStarted = false;
-    this.pcmQueue = [];
+    try {
+      decoder.stopAll();
+    } catch (e) { /* 忽略 */ }
   }
 
   stop(): void {
     this.playing = false;
-    this.stopDecoderOnly();
-    try {
-      this.renderer?.stop();
-      this.renderer?.release();
-    } catch (e) { /* 忽略 */ }
-    this.renderer = null;
-    try {
-      decoder.stopAll();
-    } catch (e) { /* 忽略 */ }
+    this.cleanupSession();
     try {
       this.client.close();
     } catch (e) { /* 忽略 */ }

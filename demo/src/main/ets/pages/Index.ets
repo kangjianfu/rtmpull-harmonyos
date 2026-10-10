@@ -26,6 +26,9 @@ struct Index {
       this.addLog('流断开');
       this.stopPlay();
     };
+    this.player.onError = (msg: string) => {
+      this.addLog(msg);
+    };
   }
 
   aboutToDisappear(): void {
