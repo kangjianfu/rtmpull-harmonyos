@@ -66,4 +66,4 @@ Apache-2.0（见 [LICENSE](LICENSE)、[NOTICE](NOTICE)）
 
 ---
 
-由 [视创新云（北京）科技有限公司](https://www.widk.cn) 开源 · 体云动赛事平台（www.widk.cn）生产环境打磨
+由 [视创新云（北京）科技有限公司](https://www.widk.cn) 开源
