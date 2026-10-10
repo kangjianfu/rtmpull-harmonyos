@@ -1,6 +1,8 @@
 // demo/pages/Index.ets — rtmpull 演示：输入 HTTP-FLV 地址，拉流播放
 import { promptAction } from '@kit.ArkUI';
 import { pasteboard } from '@kit.BasicServicesKit';
+import { scanBarcode } from '@kit.ScanKit';
+import { common } from '@kit.AbilityKit';
 import { PullPlayer } from 'rtmpull';
 
 @Entry
@@ -67,6 +69,23 @@ struct Index {
     this.statusText = '已停止';
   }
 
+  /** 扫码输入（系统扫码界面，识别二维码里的拉流地址） */
+  private async scanUrl(): Promise<void> {
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      const result = await scanBarcode.startScanForResult(ctx);
+      const text = result.originalValue ?? '';
+      if (text.startsWith('http')) {
+        this.playUrl = text;
+        this.addLog('扫码成功');
+      } else if (text.length > 0) {
+        promptAction.showToast({ message: '二维码内容不是拉流地址' });
+      }
+    } catch (e) {
+      // 用户取消或设备不支持（模拟器无相机）
+    }
+  }
+
   /** 从剪贴板粘贴拉流地址 */
   private pasteUrl(): void {
     try {
@@ -123,6 +142,17 @@ struct Index {
         })
 
       Row({ space: 8 }) {
+        Button('扫码输入')
+          .height(44)
+          .fontSize(14)
+          .fontColor(Color.White)
+          .backgroundColor('#16a34a')
+          .borderRadius(12)
+          .layoutWeight(1)
+          .enabled(!this.playing)
+          .onClick(() => {
+            this.scanUrl();
+          })
         Button('粘贴地址')
           .height(44)
           .fontSize(14)

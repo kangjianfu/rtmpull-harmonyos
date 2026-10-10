@@ -2,7 +2,7 @@
   "string": [
     { "name": "app_name", "value": "rtmpull Demo" },
     { "name": "demo_desc", "value": "rtmpull 播放库演示" },
-    { "name": "camera_reason", "value": "用于视频采集播放演示" },
+    { "name": "camera_reason", "value": "用于扫码输入拉流地址" },
     { "name": "mic_reason", "value": "用于音频采集播放演示" }
   ]
 }
