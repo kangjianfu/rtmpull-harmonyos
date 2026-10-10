@@ -1,0 +1,9 @@
+{
+  "name": "rtmpull",
+  "version": "0.1.0",
+  "description": "鸿蒙原生拉流播放库：纯 ArkTS HTTP-FLV 拉流解封装 + NDK H.264/H.265 硬解直渲 + AAC 解码，零第三方依赖",
+  "main": "Index.ets",
+  "author": "shichuangyun",
+  "license": "Apache-2.0",
+  "dependencies": {}
+}
